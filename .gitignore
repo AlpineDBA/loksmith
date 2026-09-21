@@ -1,0 +1,13 @@
+# Ignore a specific file
+.env
+values.txt
+
+# Ignore entire folders (use a trailing slash)
+dist/
+
+# Ignore all files with a specific extension
+*.log
+*.tmp
+
+# Exception: do NOT ignore this specific file
+#!.env.example
