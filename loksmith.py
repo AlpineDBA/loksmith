@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Loksmith: Mechanical Code-Breaking Assistant
-Generates an optimal single-rotation pathfor testing local dial perturbations
+Generates an optimal single-rotation path for testing local dial perturbations
 on a combination lock (1 to 6 dials) with zero duplicate combinations.
 """
 
@@ -11,6 +11,23 @@ import json
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+
+class LoksmithHelpFormatter(argparse.HelpFormatter):
+    """Custom formatter providing extra width, clean metavars, spacing, and preserved epilog formatting."""
+
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=32, width=100)
+
+    def _split_lines(self, text, width):
+        lines = super()._split_lines(text, width)
+        lines.append("")
+        return lines
+
+    def _fill_text(self, text, width, indent):
+        # Preserve raw linebreaks and indentations for epilog examples
+        return "\n".join(f"{indent}{line}" for line in text.splitlines())
+
 
 def get_candidate_dial_values(base_digit: int, rotations: int) -> List[int]:
     """
@@ -137,9 +154,15 @@ def export_txt(
     rotations: int,
     unique_per_wheel: int,
     total_rotations: int,
+    iterations_only: bool = False,
 ):
-    num_wheels = len(base_key)
     with open(filepath, "w", encoding="utf-8") as f:
+        if iterations_only:
+            for item in sequence:
+                f.write(f"{item['combination']}\n")
+            return
+
+        num_wheels = len(base_key)
         f.write("=" * 64 + "\n")
         f.write("LOKSMITH COMBINATION CRACKER\n")
         f.write(f"Base Combination   : {base_key} ({num_wheels} wheels)\n")
@@ -168,49 +191,65 @@ def export_json(
     rotations: int,
     unique_per_wheel: int,
     total_rotations: int,
+    iterations_only: bool = False,
 ):
-    payload = {
-        "metadata": {
-            "base_key": base_key,
-            "wheel_count": len(base_key),
-            "rotations_offset": rotations,
-            "unique_values_per_wheel": unique_per_wheel,
-            "total_combinations": len(sequence),
-            "duplicates_count": 0,
-            "total_rotations": total_rotations,
-            "rotations_per_test_average": round(
-                total_rotations / (len(sequence) - 1), 4
-            )
-            if len(sequence) > 1
-            else 0.0,
-            "strategy": "Deduplicated Multi-Radix Reflected Gray Code",
-        },
-        "sequence": [
-            {
-                "step": item["step"],
-                "combination": item["combination"],
-                "action": item["action"],
-                "wheel_changed": item["wheel_changed"],
-                "direction": item["direction"],
-            }
-            for item in sequence
-        ],
-    }
+    if iterations_only:
+        payload = [item["combination"] for item in sequence]
+    else:
+        payload = {
+            "metadata": {
+                "base_key": base_key,
+                "wheel_count": len(base_key),
+                "rotations_offset": rotations,
+                "unique_values_per_wheel": unique_per_wheel,
+                "total_combinations": len(sequence),
+                "duplicates_count": 0,
+                "total_rotations": total_rotations,
+                "rotations_per_test_average": round(
+                    total_rotations / (len(sequence) - 1), 4
+                )
+                if len(sequence) > 1
+                else 0.0,
+                "strategy": "Deduplicated Multi-Radix Reflected Gray Code",
+            },
+            "sequence": [
+                {
+                    "step": item["step"],
+                    "combination": item["combination"],
+                    "action": item["action"],
+                    "wheel_changed": item["wheel_changed"],
+                    "direction": item["direction"],
+                }
+                for item in sequence
+            ],
+        }
+
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
-def export_csv(filepath: Path, sequence: List[Dict], num_wheels: int):
-    wheel_headers = [f"wheel_{i+1}" for i in range(num_wheels)]
-    fieldnames = [
-        "step",
-        "combination",
-        *wheel_headers,
-        "wheel_changed",
-        "direction",
-        "action",
-    ]
+def export_csv(
+    filepath: Path,
+    sequence: List[Dict],
+    num_wheels: int,
+    iterations_only: bool = False,
+):
     with open(filepath, "w", newline="", encoding="utf-8") as f:
+        if iterations_only:
+            writer = csv.writer(f)
+            for item in sequence:
+                writer.writerow([item["combination"]])
+            return
+
+        wheel_headers = [f"wheel_{i+1}" for i in range(num_wheels)]
+        fieldnames = [
+            "step",
+            "combination",
+            *wheel_headers,
+            "wheel_changed",
+            "direction",
+            "action",
+        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for item in sequence:
@@ -227,37 +266,71 @@ def export_csv(filepath: Path, sequence: List[Dict], num_wheels: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        prog="locsmith",
-        description="Generate an optimal, minimum-rotation code-cracking sequence for a 1-to-6 dial lock.",
+    sample_usage = (
+        "Examples:\n"
+        "  python loksmith.py -k 042\n"
+        "  python loksmith.py -k 7531 -c 3 -e csv\n"
+        "  python loksmith.py -k 0875 -c 2 -e txt -i -o ./output"
     )
-    parser.add_argument(
+
+    parser = argparse.ArgumentParser(
+        prog="loksmith",
+        description="Generate an optimal, minimum-rotation code-cracking sequence for a 1-to-6 dial lock.\n",
+        epilog=sample_usage,
+        formatter_class=LoksmithHelpFormatter,
+        add_help=False,
+    )
+
+    req_group = parser.add_argument_group("Required Arguments")
+    req_group.add_argument(
         "-k",
         "--key",
         required=True,
         type=str,
+        metavar="DIGITS",
         help="Current lock state between 1 and 6 digits (e.g. 753, 0875, 123456)",
     )
-    parser.add_argument(
+
+    gen_group = parser.add_argument_group("Cracking Parameters")
+    gen_group.add_argument(
         "-c",
         "--count",
         type=int,
         default=2,
-        help="Number of dial ticks forward and backward per wheel (1-9, default: 2)",
+        metavar="1-9",
+        help="Dial ticks forward and backward per wheel (default: 2)",
     )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=str,
-        default=".",
-        help="Directory path to save the output file (default: current directory)",
-    )
-    parser.add_argument(
+
+    out_group = parser.add_argument_group("Output Options")
+    out_group.add_argument(
         "-e",
         "--export",
         default="txt",
         choices=["txt", "json", "csv"],
-        help="Export format: txt, json, or csv (default: txt)",
+        metavar="FORMAT",
+        help="File format to export: txt, json, or csv (default: txt)",
+    )
+    out_group.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=".",
+        metavar="PATH",
+        help="Directory path to save the output file (default: current directory)",
+    )
+    out_group.add_argument(
+        "-i",
+        "--iterations-only",
+        action="store_true",
+        help="Export raw combinations only, omitting headers and step actions",
+    )
+
+    info_group = parser.add_argument_group("Help")
+    info_group.add_argument(
+        "-h",
+        "--help",
+        action="help",
+        help="Show this help message and exit",
     )
 
     args = parser.parse_args()
@@ -300,14 +373,35 @@ def main():
 
     # Export to requested format
     if out_format == "txt":
-        export_txt(out_file, sequence, key, args.count, unique_per_wheel, total_rotations)
+        export_txt(
+            out_file,
+            sequence,
+            key,
+            args.count,
+            unique_per_wheel,
+            total_rotations,
+            iterations_only=args.iterations_only,
+        )
     elif out_format == "json":
-        export_json(out_file, sequence, key, args.count, unique_per_wheel, total_rotations)
+        export_json(
+            out_file,
+            sequence,
+            key,
+            args.count,
+            unique_per_wheel,
+            total_rotations,
+            iterations_only=args.iterations_only,
+        )
     elif out_format == "csv":
-        export_csv(out_file, sequence, len(key))
+        export_csv(
+            out_file,
+            sequence,
+            len(key),
+            iterations_only=args.iterations_only,
+        )
 
     print("\n+======================================================+")
-    print("|  LOKSMITH: Code-Breaking Sequence Generator        |")
+    print("|  LOKSMITH: Code-Breaking Sequence Generator          |")
     print("+======================================================+")
     print(f"  Base Key           : {key} ({len(key)} wheels)")
     print(f"  Requested Sweep    : +/- {args.count} clicks")
@@ -315,13 +409,17 @@ def main():
     print(f"  Total Combinations : {total_combos:,} (0 duplicates)")
     print(f"  Total Dial Clicks  : {total_rotations:,}")
     print(f"  Efficiency         : Exactly 1 tick per test step")
+    print(f"  Iterations Only    : {'Enabled' if args.iterations_only else 'Disabled'}")
     print(f"  Exported File      : {out_file}\n")
 
     preview_count = min(6, total_combos)
     print(f"Preview of first {preview_count} steps:")
     for item in sequence[:preview_count]:
-        action_desc = f"({item['action']})" if item["action"] else ""
-        print(f"  [{item['step']:07d}]  {item['combination']}  {action_desc}")
+        if args.iterations_only:
+            print(f"  {item['combination']}")
+        else:
+            action_desc = f"({item['action']})" if item["action"] else ""
+            print(f"  [{item['step']:07d}]  {item['combination']}  {action_desc}")
     if total_combos > preview_count:
         print(f"  ... ({total_combos - preview_count:,} more steps saved to {out_file.name})\n")
 
