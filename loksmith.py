@@ -10,14 +10,14 @@ import csv
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 
 class LoksmithHelpFormatter(argparse.HelpFormatter):
     """Custom formatter providing extra width, clean metavars, spacing, and preserved epilog formatting."""
 
     def __init__(self, prog):
-        super().__init__(prog, max_help_position=32, width=100)
+        super().__init__(prog, max_help_position=34, width=100)
 
     def _split_lines(self, text, width):
         lines = super()._split_lines(text, width)
@@ -25,19 +25,91 @@ class LoksmithHelpFormatter(argparse.HelpFormatter):
         return lines
 
     def _fill_text(self, text, width, indent):
-        # Preserve raw linebreaks and indentations for epilog examples
         return "\n".join(f"{indent}{line}" for line in text.splitlines())
 
 
-def get_candidate_dial_values(base_digit: int, rotations: int) -> List[int]:
+def parse_exclusions(exclude_args: List[str], num_wheels: int) -> Dict[int, Set[int]]:
     """
-    Returns contiguous physical wheel values arranged in cyclic dial order
-    from (base - rotations) up to (base + rotations), with duplicates removed.
+    Parses exclusion specifications across three supported formats:
+      1. Dial-targeted: '1:45,3:0' or 'all:4' (1-indexed wheel:digits)
+      2. Positional:    '45,,0' (comma-separated matching wheel count)
+      3. Global:        '45' (digits excluded across all wheels)
+    """
+    excluded: Dict[int, Set[int]] = {w: set() for w in range(num_wheels)}
+    if not exclude_args:
+        return excluded
 
-    Because a dial has only 10 unique faces (0-9), any sweep where
-    (2 * rotations + 1) > 10 wraps around itself. We deduplicate prior
-    to sequence generation while strictly preserving adjacent dial order.
+    for raw_arg in exclude_args:
+        raw_arg = raw_arg.strip()
+        if not raw_arg:
+            continue
+
+        if ":" in raw_arg:
+            items = [item.strip() for item in raw_arg.split(",") if item.strip()]
+            for item in items:
+                if ":" not in item:
+                    raise ValueError(f"Malformed exclusion entry '{item}'. Expected format 'dial:digits'")
+                dial_spec, digits_spec = item.split(":", 1)
+                dial_spec = dial_spec.strip().lower()
+                digits = [int(d) for d in digits_spec.strip() if d.isdigit()]
+                if not digits:
+                    raise ValueError(f"No digits specified in exclusion entry '{item}'")
+
+                if dial_spec in ("all", "*"):
+                    for w in range(num_wheels):
+                        excluded[w].update(digits)
+                elif dial_spec.isdigit():
+                    w_idx = int(dial_spec) - 1
+                    if not (0 <= w_idx < num_wheels):
+                        raise ValueError(
+                            f"Dial index '{dial_spec}' out of range. Lock has dials 1 through {num_wheels}"
+                        )
+                    excluded[w_idx].update(digits)
+                else:
+                    raise ValueError(f"Unrecognized dial identifier '{dial_spec}' in exclusion '{item}'")
+
+        elif "," in raw_arg:
+            parts = raw_arg.split(",")
+            if len(parts) != num_wheels:
+                raise ValueError(
+                    f"Positional exclusion '{raw_arg}' specifies {len(parts)} dials, "
+                    f"but lock has {num_wheels} dials."
+                )
+            for w, part in enumerate(parts):
+                for ch in part.strip():
+                    if ch.isdigit():
+                        excluded[w].add(int(ch))
+
+        else:
+            if not raw_arg.isdigit():
+                raise ValueError(f"Invalid global exclusion '{raw_arg}'. Must contain only digits 0-9.")
+            for ch in raw_arg:
+                for w in range(num_wheels):
+                    excluded[w].add(int(ch))
+
+    return excluded
+
+
+def get_candidate_dial_values(
+    base_char: str, rotations: int, excluded: Set[int]
+) -> List[int]:
     """
+    Returns contiguous physical wheel values arranged in cyclic dial order,
+    omitting any digits specified in `excluded`.
+
+    - If base_char is '?', candidate values represent a full sweep across
+      all non-excluded dial faces (0-9).
+    - If base_char is a digit (0-9), candidates sweep from (base - rotations)
+      up to (base + rotations) in cyclic dial order with duplicates and
+      exclusions removed.
+    """
+    if base_char == "?":
+        return [d for d in range(10) if d not in excluded]
+
+    base_digit = int(base_char)
+    if rotations == 0:
+        return [] if base_digit in excluded else [base_digit]
+
     raw_values = [
         (base_digit - rotations + i) % 10 for i in range(2 * rotations + 1)
     ]
@@ -45,7 +117,7 @@ def get_candidate_dial_values(base_digit: int, rotations: int) -> List[int]:
     seen = set()
     unique_dial_values = []
     for val in raw_values:
-        if val not in seen:
+        if val not in seen and val not in excluded:
             seen.add(val)
             unique_dial_values.append(val)
 
@@ -73,22 +145,33 @@ def generate_reflected_gray_indices(radices: List[int]) -> List[Tuple[int, ...]]
 
 
 def build_cracking_sequence(
-    key_str: str, rotations: int
-) -> Tuple[List[Dict], int, int]:
+    key_str: str,
+    wheel_rotations: List[int],
+    excluded_map: Dict[int, Set[int]],
+) -> Tuple[List[Dict], int, List[List[int]]]:
     """
-    Deduplicates wheel candidate spaces and builds the step-by-step
-    minimum-rotation Gray code sequence for any key length up to 6 dials.
+    Constructs candidate spaces per wheel taking into account per-wheel offsets,
+    pattern wildcards, and excluded digits. Traverses the resulting state space
+    using a multi-radix Reflected Gray Code.
     """
-    base_digits = [int(char) for char in key_str]
-    num_wheels = len(base_digits)
+    num_wheels = len(key_str)
 
-    # 1. Deduplicate candidate values per wheel prior to organizing sequence
     wheel_candidates = [
-        get_candidate_dial_values(d, rotations=rotations) for d in base_digits
+        get_candidate_dial_values(
+            key_str[i], rotations=wheel_rotations[i], excluded=excluded_map[i]
+        )
+        for i in range(num_wheels)
     ]
-    radices = [len(c) for c in wheel_candidates]
 
-    # 2. Generate minimal single-rotation Gray code traversal
+    for w, cand in enumerate(wheel_candidates):
+        if not cand:
+            print(
+                f"Error: Wheel {w + 1} has 0 valid candidate values after exclusions.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    radices = [len(c) for c in wheel_candidates]
     gray_tuples = generate_reflected_gray_indices(radices)
 
     sequence = []
@@ -117,20 +200,17 @@ def build_cracking_sequence(
             direction = None
             delta = 0
 
-            # Dynamic check across all wheels
             for w in range(num_wheels):
                 if combo_digits[w] != prev_digits[w]:
-                    changed_wheel = w + 1  # 1-indexed for manual dialing
+                    changed_wheel = w + 1
                     diff = (combo_digits[w] - prev_digits[w]) % 10
-                    if diff == 1:
-                        direction = "UP (+1)"
-                        delta = 1
-                    elif diff == 9:
-                        direction = "DOWN (-1)"
-                        delta = -1
-                    else:
-                        direction = f"SHIFT ({diff:+d})"
+                    if diff <= 5:
+                        direction = f"UP (+{diff})"
                         delta = diff
+                    else:
+                        down_clicks = 10 - diff
+                        direction = f"DOWN (-{down_clicks})"
+                        delta = -down_clicks
                     break
 
             total_rotations += abs(delta)
@@ -144,15 +224,16 @@ def build_cracking_sequence(
                 "delta": delta,
             })
 
-    return sequence, total_rotations, radices[0]
+    return sequence, total_rotations, wheel_candidates
 
 
 def export_txt(
     filepath: Path,
     sequence: List[Dict],
     base_key: str,
-    rotations: int,
-    unique_per_wheel: int,
+    wheel_rotations: List[int],
+    wheel_candidates: List[List[int]],
+    excluded_map: Dict[int, Set[int]],
     total_rotations: int,
     iterations_only: bool = False,
 ):
@@ -163,15 +244,27 @@ def export_txt(
             return
 
         num_wheels = len(base_key)
-        f.write("=" * 64 + "\n")
+        f.write("=" * 68 + "\n")
         f.write("LOKSMITH COMBINATION CRACKER\n")
         f.write(f"Base Combination   : {base_key} ({num_wheels} wheels)\n")
-        f.write(f"Rotations Offset   : +/- {rotations} clicks per wheel\n")
-        f.write(f"Unique Digits/Dial : {unique_per_wheel} (out of 10)\n")
+        offsets_str = ", ".join(f"W{i+1}: +/-{r}" for i, r in enumerate(wheel_rotations))
+        f.write(f"Rotations Offset   : {offsets_str}\n")
+        cand_str = ", ".join(f"W{i+1}: {len(c)}" for i, c in enumerate(wheel_candidates))
+        f.write(f"Candidates / Wheel : {cand_str}\n")
+
+        has_excl = any(bool(excluded_map[w]) for w in range(num_wheels))
+        if has_excl:
+            excl_str = ", ".join(
+                f"W{w+1}: {{{','.join(str(d) for d in sorted(excluded_map[w]))}}}"
+                for w in range(num_wheels)
+                if excluded_map[w]
+            )
+            f.write(f"Excluded Digits    : {excl_str}\n")
+
         f.write(f"Total Combinations : {len(sequence):,} (0 duplicates)\n")
         f.write(f"Total Dial Clicks  : {total_rotations:,}\n")
-        f.write("Optimization       : Reflected Gray Code (1 tick / step)\n")
-        f.write("=" * 64 + "\n\n")
+        f.write("Optimization       : Reflected Gray Code Traversal\n")
+        f.write("=" * 68 + "\n\n")
 
         for item in sequence:
             if item["step"] == 1:
@@ -188,20 +281,28 @@ def export_json(
     filepath: Path,
     sequence: List[Dict],
     base_key: str,
-    rotations: int,
-    unique_per_wheel: int,
+    wheel_rotations: List[int],
+    wheel_candidates: List[List[int]],
+    excluded_map: Dict[int, Set[int]],
     total_rotations: int,
     iterations_only: bool = False,
 ):
     if iterations_only:
         payload = [item["combination"] for item in sequence]
     else:
+        num_wheels = len(base_key)
         payload = {
             "metadata": {
                 "base_key": base_key,
-                "wheel_count": len(base_key),
-                "rotations_offset": rotations,
-                "unique_values_per_wheel": unique_per_wheel,
+                "wheel_count": num_wheels,
+                "wheel_offsets": wheel_rotations,
+                "candidates_per_wheel": [len(c) for c in wheel_candidates],
+                "candidate_values": wheel_candidates,
+                "excluded_digits": {
+                    f"wheel_{w+1}": sorted(list(excluded_map[w]))
+                    for w in range(num_wheels)
+                    if excluded_map[w]
+                },
                 "total_combinations": len(sequence),
                 "duplicates_count": 0,
                 "total_rotations": total_rotations,
@@ -210,7 +311,7 @@ def export_json(
                 )
                 if len(sequence) > 1
                 else 0.0,
-                "strategy": "Deduplicated Multi-Radix Reflected Gray Code",
+                "strategy": "Constrained Multi-Radix Reflected Gray Code",
             },
             "sequence": [
                 {
@@ -269,8 +370,10 @@ def main():
     sample_usage = (
         "Examples:\n"
         "  python loksmith.py -k 042\n"
-        "  python loksmith.py -k 7531 -c 3 -e csv\n"
-        "  python loksmith.py -k 0875 -c 2 -e txt -i -o ./output"
+        "  python loksmith.py -k 7?3 -c 1\n"
+        "  python loksmith.py -k 7531 -c 0,1,3,5\n"
+        "  python loksmith.py -k 08?5 -x 1:45,3:0 -e json\n"
+        "  python loksmith.py -k 4921 -c 2 -x 45,,0,9 -e csv"
     )
 
     parser = argparse.ArgumentParser(
@@ -287,18 +390,26 @@ def main():
         "--key",
         required=True,
         type=str,
-        metavar="DIGITS",
-        help="Current lock state between 1 and 6 digits (e.g. 753, 0875, 123456)",
+        metavar="PATTERN",
+        help="Lock combination (1-6 chars): digits (0-9) and '?' wildcards (e.g. 753, 7?3, ??)",
     )
 
     gen_group = parser.add_argument_group("Cracking Parameters")
     gen_group.add_argument(
         "-c",
         "--count",
-        type=int,
-        default=2,
-        metavar="1-5",
-        help="Dial ticks forward and backward per wheel (1-5, default: 2)",
+        type=str,
+        default="2",
+        metavar="COUNTS",
+        help="Dial ticks offset (0-5) per wheel: single integer or comma-separated vector (default: 2)",
+    )
+    gen_group.add_argument(
+        "-x",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help="Exclude digits: dial-targeted (1:45,3:0), positional (45,,0), or global (45)",
     )
 
     out_group = parser.add_argument_group("Output Options")
@@ -335,21 +446,62 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate lock key: must be between 1 and 6 digits
+    # Validate key pattern (1 to 6 chars, 0-9 or '?')
     key = args.key.strip()
-    if not (1 <= len(key) <= 6) or not key.isdigit():
+    if not (1 <= len(key) <= 6) or not all(ch.isdigit() or ch == "?" for ch in key):
         print(
-            f"Error: Key must be between 1 and 6 digits (0-9). Received: '{args.key}' ({len(key)} digits)",
+            f"Error: Key must be 1 to 6 characters containing digits (0-9) or '?' wildcards. Received: '{args.key}'",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # Validate rotation count (1 to 5)
-    if not (1 <= args.count <= 5):
-        print(
-            f"Error: Rotation count (-c) must be an integer between 1 and 5. Received: {args.count}",
-            file=sys.stderr,
-        )
+    num_wheels = len(key)
+
+    # Parse and validate rotation counts (0 to 5 per wheel)
+    count_str = args.count.strip()
+    if "," in count_str:
+        raw_counts = count_str.split(",")
+        if len(raw_counts) != num_wheels:
+            print(
+                f"Error: Count vector length ({len(raw_counts)}) does not match key length ({num_wheels}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        wheel_rotations = []
+        for idx, val in enumerate(raw_counts):
+            val_clean = val.strip()
+            if not val_clean.isdigit() or not (0 <= int(val_clean) <= 5):
+                print(
+                    f"Error: Offset for wheel {idx + 1} must be an integer between 0 and 5. Received: '{val_clean}'",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            wheel_rotations.append(int(val_clean))
+    else:
+        if not count_str.isdigit() or not (0 <= int(count_str) <= 5):
+            print(
+                f"Error: Count offset must be an integer between 0 and 5. Received: '{count_str}'",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        base_count = int(count_str)
+        # Wildcards default to full sweep (5), while known digits use base_count
+        wheel_rotations = [5 if ch == "?" else base_count for ch in key]
+
+    # Wildcard dials must have an offset of 5
+    for idx, ch in enumerate(key):
+        if ch == "?" and wheel_rotations[idx] != 5:
+            print(
+                f"Error: Wildcard dial {idx + 1} ('?') requires full sweep (count 5). Received count: {wheel_rotations[idx]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Parse exclusions
+    try:
+        excluded_map = parse_exclusions(args.exclude, num_wheels)
+    except ValueError as err:
+        print(f"Error parsing exclusion argument: {err}", file=sys.stderr)
         sys.exit(1)
 
     # Resolve output directory
@@ -363,11 +515,12 @@ def main():
         )
         sys.exit(1)
 
+    clean_key_name = key.replace("?", "X")
     out_format = args.export.lower()
-    out_file = output_dir / f"loksmith_{key}.{out_format}"
+    out_file = output_dir / f"loksmith_{clean_key_name}.{out_format}"
 
-    sequence, total_rotations, unique_per_wheel = build_cracking_sequence(
-        key, rotations=args.count
+    sequence, total_rotations, wheel_candidates = build_cracking_sequence(
+        key, wheel_rotations, excluded_map
     )
     total_combos = len(sequence)
 
@@ -377,8 +530,9 @@ def main():
             out_file,
             sequence,
             key,
-            args.count,
-            unique_per_wheel,
+            wheel_rotations,
+            wheel_candidates,
+            excluded_map,
             total_rotations,
             iterations_only=args.iterations_only,
         )
@@ -387,8 +541,9 @@ def main():
             out_file,
             sequence,
             key,
-            args.count,
-            unique_per_wheel,
+            wheel_rotations,
+            wheel_candidates,
+            excluded_map,
             total_rotations,
             iterations_only=args.iterations_only,
         )
@@ -396,19 +551,31 @@ def main():
         export_csv(
             out_file,
             sequence,
-            len(key),
+            num_wheels,
             iterations_only=args.iterations_only,
         )
+
+    offsets_display = ", ".join(f"W{i+1}: +/-{r}" for i, r in enumerate(wheel_rotations))
+    cand_display = ", ".join(f"W{i+1}: {len(c)}" for i, c in enumerate(wheel_candidates))
+    has_excl = any(bool(excluded_map[w]) for w in range(num_wheels))
 
     print("\n+======================================================+")
     print("|  LOKSMITH: Code-Breaking Sequence Generator          |")
     print("+======================================================+")
-    print(f"  Base Key           : {key} ({len(key)} wheels)")
-    print(f"  Requested Sweep    : +/- {args.count} clicks")
-    print(f"  Unique Values/Dial : {unique_per_wheel} of 10")
+    print(f"  Base Key           : {key} ({num_wheels} wheels)")
+    print(f"  Offsets Per Wheel  : {offsets_display}")
+    print(f"  Candidates / Wheel : {cand_display}")
+    if has_excl:
+        excl_disp = ", ".join(
+            f"W{w+1}: {{{','.join(str(d) for d in sorted(excluded_map[w]))}}}"
+            for w in range(num_wheels)
+            if excluded_map[w]
+        )
+        print(f"  Excluded Digits    : {excl_disp}")
     print(f"  Total Combinations : {total_combos:,} (0 duplicates)")
     print(f"  Total Dial Clicks  : {total_rotations:,}")
-    print(f"  Efficiency         : Exactly 1 tick per test step")
+    avg_clicks = total_rotations / (total_combos - 1) if total_combos > 1 else 0.0
+    print(f"  Average Clicks/Step: {avg_clicks:.2f}")
     print(f"  Iterations Only    : {'Enabled' if args.iterations_only else 'Disabled'}")
     print(f"  Exported File      : {out_file}\n")
 
