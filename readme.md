@@ -57,7 +57,7 @@ python3 loksmith.py -k <KEY> [-c <COUNT>] [-o <OUTPUT_DIR>] [-e <FORMAT>]
 | Flag | Long Flag | Description | Default |
 |------|-----------|-------------|---------|
 | `-k` | `--key` | **Required.** Base lock combination (1 to 6 digits, e.g., `753`, `0875`). | — |
-| `-c` | `--count` | Search offset: dial ticks forward and backward per wheel ($1 \le c \le 9$). | `2` |
+| `-c` | `--count` | Search offset: dial ticks forward and backward per wheel ($1 \le c \le 5$). | `2` |
 | `-o` | `--output` | Directory where the generated plan should be saved. | `.` |
 | `-e` | `--export` | Output format: `txt`, `json`, or `csv`. | `txt` |
 

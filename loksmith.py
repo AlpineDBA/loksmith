@@ -297,8 +297,8 @@ def main():
         "--count",
         type=int,
         default=2,
-        metavar="1-9",
-        help="Dial ticks forward and backward per wheel (default: 2)",
+        metavar="1-5",
+        help="Dial ticks forward and backward per wheel (1-5, default: 2)",
     )
 
     out_group = parser.add_argument_group("Output Options")
@@ -344,10 +344,10 @@ def main():
         )
         sys.exit(1)
 
-    # Validate rotation count (1 to 9)
-    if not (1 <= args.count <= 9):
+    # Validate rotation count (1 to 5)
+    if not (1 <= args.count <= 5):
         print(
-            f"Error: Rotation count (-c) must be an integer between 1 and 9. Received: {args.count}",
+            f"Error: Rotation count (-c) must be an integer between 1 and 5. Received: {args.count}",
             file=sys.stderr,
         )
         sys.exit(1)
