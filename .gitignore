@@ -8,6 +8,7 @@ dist/
 # Ignore all files with a specific extension
 *.log
 *.tmp
+*.txt
 
 # Exception: do NOT ignore this specific file
 #!.env.example

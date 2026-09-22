@@ -8,9 +8,110 @@ on a combination lock (1 to 6 dials) with zero duplicate combinations.
 import argparse
 import csv
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
+
+# Enable Virtual Terminal / ANSI processing on Windows consoles
+if os.name == "nt":
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        os.system("")  # Fallback VT initializer on Windows 10/11
+
+# ANSI Color Codes
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+C_RED = "\033[91m"
+C_GREEN = "\033[92m"
+C_YELLOW = "\033[93m"
+C_BLUE = "\033[94m"
+C_MAGENTA = "\033[95m"
+C_CYAN = "\033[96m"
+C_WHITE = "\033[97m"
+
+# 5-Row High-Legibility Block Digits (8 columns wide)
+BIG_DIGITS = {
+    0: [
+        " ▄████▄ ",
+        "██    ██",
+        "██    ██",
+        "██    ██",
+        " ▀████▀ ",
+    ],
+    1: [
+        "   ██   ",
+        " ▄███   ",
+        "   ██   ",
+        "   ██   ",
+        " ██████ ",
+    ],
+    2: [
+        " ██████ ",
+        "     ██ ",
+        " ▄████▀ ",
+        "██      ",
+        "███████ ",
+    ],
+    3: [
+        "███████ ",
+        "     ██ ",
+        " ▄████▀ ",
+        "     ██ ",
+        "███████ ",
+    ],
+    4: [
+        "██   ██ ",
+        "██   ██ ",
+        "███████ ",
+        "     ██ ",
+        "     ██ ",
+    ],
+    5: [
+        "███████ ",
+        "██      ",
+        "██████▄ ",
+        "     ██ ",
+        "██████▀ ",
+    ],
+    6: [
+        " ▄████▄ ",
+        "██      ",
+        "██████▄ ",
+        "██    ██",
+        " ▀████▀ ",
+    ],
+    7: [
+        "████████",
+        "   ▄██▀ ",
+        "  ▄██▀  ",
+        " ▄██▀   ",
+        "██▀     ",
+    ],
+    8: [
+        " ▄████▄ ",
+        "██    ██",
+        " ▀████▀ ",
+        "██    ██",
+        " ▀████▀ ",
+    ],
+    9: [
+        " ▄████▄ ",
+        "██    ██",
+        " ▀██████",
+        "     ██ ",
+        " ▀████▀ ",
+    ],
+}
 
 
 class LoksmithHelpFormatter(argparse.HelpFormatter):
@@ -28,13 +129,89 @@ class LoksmithHelpFormatter(argparse.HelpFormatter):
         return "\n".join(f"{indent}{line}" for line in text.splitlines())
 
 
+def get_key() -> str:
+    """Reads a single keypress from standard input across platforms."""
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        return line.strip().lower()
+
+    try:
+        # Windows
+        import msvcrt
+
+        ch = msvcrt.getch()
+        if ch in (b"\x00", b"\xe0"):
+            ext = msvcrt.getch()
+            if ext == b"H":
+                return "up"
+            if ext == b"P":
+                return "down"
+            if ext == b"K":
+                return "left"
+            if ext == b"M":
+                return "right"
+            return ""
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch == b" ":
+            return "space"
+        if ch == b"\x1b":
+            return "esc"
+        if ch == b"\x03":
+            raise KeyboardInterrupt
+        return ch.decode("utf-8", errors="ignore").lower()
+    except ImportError:
+        # Unix / macOS
+        try:
+            import select
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":
+                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r:
+                        seq = sys.stdin.read(2)
+                        if seq == "[A":
+                            return "up"
+                        if seq == "[B":
+                            return "down"
+                        if seq == "[C":
+                            return "right"
+                        if seq == "[D":
+                            return "left"
+                    return "esc"
+                if ch in ("\r", "\n"):
+                    return "enter"
+                if ch == " ":
+                    return "space"
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                return ch.lower()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except Exception:
+            try:
+                return input().strip().lower()[:1]
+            except (KeyboardInterrupt, EOFError):
+                return "q"
+
+
+def format_time(seconds: float) -> str:
+    """Formats seconds into MM:SS or HH:MM:SS."""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
 def parse_exclusions(exclude_args: List[str], num_wheels: int) -> Dict[int, Set[int]]:
-    """
-    Parses exclusion specifications across three supported formats:
-      1. Dial-targeted: '1:45,3:0' or 'all:4' (1-indexed wheel:digits)
-      2. Positional:    '45,,0' (comma-separated matching wheel count)
-      3. Global:        '45' (digits excluded across all wheels)
-    """
+    """Parses exclusion specifications across targeted, positional, and global formats."""
     excluded: Dict[int, Set[int]] = {w: set() for w in range(num_wheels)}
     if not exclude_args:
         return excluded
@@ -93,16 +270,7 @@ def parse_exclusions(exclude_args: List[str], num_wheels: int) -> Dict[int, Set[
 def get_candidate_dial_values(
     base_char: str, rotations: int, excluded: Set[int]
 ) -> List[int]:
-    """
-    Returns contiguous physical wheel values arranged in cyclic dial order,
-    omitting any digits specified in `excluded`.
-
-    - If base_char is '?', candidate values represent a full sweep across
-      all non-excluded dial faces (0-9).
-    - If base_char is a digit (0-9), candidates sweep from (base - rotations)
-      up to (base + rotations) in cyclic dial order with duplicates and
-      exclusions removed.
-    """
+    """Returns candidate physical values in cyclic dial order without duplicates or exclusions."""
     if base_char == "?":
         return [d for d in range(10) if d not in excluded]
 
@@ -125,11 +293,7 @@ def get_candidate_dial_values(
 
 
 def generate_reflected_gray_indices(radices: List[int]) -> List[Tuple[int, ...]]:
-    """
-    Generates an n-dimensional Reflected Gray Code sequence across arbitrary radices.
-    Guarantees that between any consecutive tuple, exactly ONE coordinate changes
-    by exactly +1 or -1 in its index.
-    """
+    """Generates an n-dimensional Reflected Gray Code sequence across arbitrary radices."""
     tuples: List[Tuple[int, ...]] = [()]
     for r in radices:
         next_tuples = []
@@ -149,11 +313,7 @@ def build_cracking_sequence(
     wheel_rotations: List[int],
     excluded_map: Dict[int, Set[int]],
 ) -> Tuple[List[Dict], int, List[List[int]]]:
-    """
-    Constructs candidate spaces per wheel taking into account per-wheel offsets,
-    pattern wildcards, and excluded digits. Traverses the resulting state space
-    using a multi-radix Reflected Gray Code.
-    """
+    """Builds step-by-step traversal using multi-radix Gray code."""
     num_wheels = len(key_str)
 
     wheel_candidates = [
@@ -166,7 +326,7 @@ def build_cracking_sequence(
     for w, cand in enumerate(wheel_candidates):
         if not cand:
             print(
-                f"Error: Wheel {w + 1} has 0 valid candidate values after exclusions.",
+                f"{C_RED}Error: Wheel {w + 1} has 0 valid candidate values after exclusions.{C_RESET}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -225,6 +385,169 @@ def build_cracking_sequence(
             })
 
     return sequence, total_rotations, wheel_candidates
+
+
+def run_interactive_stepper(sequence: List[Dict], base_key: str):
+    """Interactive HUD with enlarged block digits and ANSI highlights."""
+    total_steps = len(sequence)
+    if total_steps == 0:
+        print("No combinations to step through.")
+        return
+
+    current_idx = 0
+    start_time = time.time()
+    num_wheels = len(base_key)
+
+    # Precalculate cumulative clicks
+    cum_rotations = [0] * total_steps
+    acc = 0
+    for idx, item in enumerate(sequence):
+        acc += abs(item.get("delta", 0))
+        cum_rotations[idx] = acc
+
+    while True:
+        # Clear screen and return cursor to home
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+
+        item = sequence[current_idx]
+        step_num = item["step"]
+        pct = (step_num / total_steps) * 100.0
+
+        elapsed = time.time() - start_time
+        elapsed_str = format_time(elapsed)
+
+        rate = (current_idx / (elapsed / 60.0)) if elapsed > 1 and current_idx > 0 else 0.0
+        rate_str = f"{rate:.1f}/min" if rate > 0 else "--"
+
+        if rate > 0:
+            remaining_steps = total_steps - step_num
+            est_seconds = (remaining_steps / rate) * 60.0
+            est_str = format_time(est_seconds)
+        else:
+            est_str = "--:--"
+
+        clicks_so_far = cum_rotations[current_idx]
+
+        # Top Header & Live Metrics
+        print(f"{C_CYAN}+==============================================================================+{C_RESET}")
+        print(f"{C_CYAN}|{C_RESET}  {C_BOLD}LOKSMITH INTERACTIVE STEPPER{C_RESET}                                                {C_CYAN}|{C_RESET}")
+        print(f"{C_CYAN}+==============================================================================+{C_RESET}")
+        print(
+            f"  {C_BOLD}Step{C_RESET}   : {C_BOLD}{C_WHITE}{step_num:,}{C_RESET} of {total_steps:,} ({C_YELLOW}{pct:5.1f}%{C_RESET}) "
+            f"   {C_BOLD}Elapsed{C_RESET} : {C_WHITE}{elapsed_str}{C_RESET}    {C_BOLD}Cadence{C_RESET}  : {C_GREEN}{rate_str}{C_RESET}"
+        )
+        print(
+            f"  {C_BOLD}Clicks{C_RESET} : {C_YELLOW}{clicks_so_far:,}{C_RESET} total clicks"
+            f"         {C_BOLD}Est Left{C_RESET}: {C_WHITE}{est_str}{C_RESET}"
+        )
+        print(f"{C_CYAN}--------------------------------------------------------------------------------{C_RESET}")
+
+        digits = item["digits"]
+        changed_wheel = item["wheel_changed"]
+        direction = item["direction"]
+
+        # 1. Dial Header Row
+        header_cols = []
+        status_cols = []
+        for w in range(num_wheels):
+            is_active = (w + 1) == changed_wheel
+            if is_active:
+                header_cols.append(f"{C_BOLD}{C_YELLOW} DIAL {w+1} {C_RESET}")
+                status_cols.append(f"{C_BOLD}{C_YELLOW}[ACTIVE]{C_RESET}")
+            elif step_num == 1:
+                header_cols.append(f"{C_BOLD}{C_GREEN} DIAL {w+1} {C_RESET}")
+                status_cols.append(f"{C_BOLD}{C_GREEN}[ INIT ]{C_RESET}")
+            else:
+                header_cols.append(f"{C_DIM}{C_WHITE} DIAL {w+1} {C_RESET}")
+                status_cols.append(f"{C_DIM}{C_WHITE}[ HOLD ]{C_RESET}")
+
+        print("  " + "   ".join(header_cols))
+        print("  " + "   ".join(status_cols))
+        print()
+
+        # 2. Large ASCII Block Digits (5 rows tall)
+        for r in range(5):
+            row_segments = []
+            for w in range(num_wheels):
+                d = digits[w]
+                is_active = (w + 1) == changed_wheel or step_num == 1
+                color = (C_BOLD + C_YELLOW) if is_active else (C_BOLD + C_WHITE)
+                glyph_line = BIG_DIGITS.get(d, ["        "] * 5)[r]
+                row_segments.append(f"{color}{glyph_line}{C_RESET}")
+            print("  " + "   ".join(row_segments))
+
+        # 3. Pointer Indicators Below Digits
+        pointer_cols = []
+        for w in range(num_wheels):
+            if (w + 1) == changed_wheel:
+                pointer_cols.append(f"{C_BOLD}{C_YELLOW}  ▲▲▲▲  {C_RESET}")
+            elif step_num == 1:
+                pointer_cols.append(f"{C_BOLD}{C_GREEN}  ▲▲▲▲  {C_RESET}")
+            else:
+                pointer_cols.append("        ")
+        print("  " + "   ".join(pointer_cols))
+
+        # 4. Highlighted Action Banner
+        print(f"{C_CYAN}--------------------------------------------------------------------------------{C_RESET}")
+        if changed_wheel is not None:
+            if "UP" in direction:
+                dir_styled = f"{C_BOLD}{C_GREEN}{direction}{C_RESET}"
+            elif "DOWN" in direction:
+                dir_styled = f"{C_BOLD}{C_RED}{direction}{C_RESET}"
+            else:
+                dir_styled = f"{C_BOLD}{C_YELLOW}{direction}{C_RESET}"
+            print(f"  {C_BOLD}ACTION{C_RESET} : >>>  Turn {C_BOLD}{C_YELLOW}Wheel {changed_wheel}{C_RESET} {dir_styled}  <<<")
+        else:
+            print(f"  {C_BOLD}ACTION{C_RESET} : >>>  {C_BOLD}{C_GREEN}{item['action']}{C_RESET}  <<<")
+
+        spaced_code = "  ".join(str(d) for d in digits)
+        print(f"  {C_BOLD}TARGET{C_RESET} : [  {C_BOLD}{C_YELLOW}{spaced_code}{C_RESET}  ]")
+        print(f"{C_CYAN}================================================================================{C_RESET}")
+        print(
+            f"  {C_BOLD}[Space/Enter/n]{C_RESET} Next  |  {C_BOLD}[b/p]{C_RESET} Back  |  "
+            f"{C_BOLD}[g]{C_RESET} Jump  |  {C_BOLD}[f]{C_RESET} Found!  |  {C_BOLD}[q]{C_RESET} Quit"
+        )
+        print(f"{C_CYAN}--------------------------------------------------------------------------------{C_RESET}")
+
+        key = get_key()
+
+        if key in ("space", "enter", "n", "right", "down"):
+            if current_idx < total_steps - 1:
+                current_idx += 1
+        elif key in ("b", "p", "left", "up"):
+            if current_idx > 0:
+                current_idx -= 1
+        elif key == "f":
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.flush()
+            total_elapsed = time.time() - start_time
+            final_rate = (
+                (current_idx + 1) / (total_elapsed / 60.0) if total_elapsed > 0 else 0.0
+            )
+            print(f"\n{C_GREEN}+======================================================+{C_RESET}")
+            print(f"{C_GREEN}|  {C_BOLD}LOCK CRACKED! COMBINATION FOUND!{C_RESET}{C_GREEN}                    |{C_RESET}")
+            print(f"{C_GREEN}+======================================================+{C_RESET}")
+            print(f"  Winning Combination : {C_BOLD}{C_YELLOW}{item['combination']}{C_RESET}")
+            print(f"  Found at Step       : {step_num:,} of {total_steps:,}")
+            print(f"  Total Dial Clicks   : {clicks_so_far:,}")
+            print(f"  Time Elapsed        : {format_time(total_elapsed)}")
+            print(f"  Testing Cadence     : {final_rate:.1f} combinations / min")
+            print(f"{C_GREEN}+======================================================+{C_RESET}\n")
+            return
+        elif key == "g":
+            print()
+            try:
+                target_str = input(f"Enter target step (1-{total_steps}): ").strip()
+                if target_str.isdigit():
+                    target = int(target_str)
+                    if 1 <= target <= total_steps:
+                        current_idx = target - 1
+            except (KeyboardInterrupt, EOFError):
+                pass
+        elif key in ("q", "esc"):
+            print(f"\nExited interactive stepper at step {step_num:,} ([{item['combination']}]).\n")
+            return
 
 
 def export_txt(
@@ -372,7 +695,7 @@ def main():
         "  python loksmith.py -k 042\n"
         "  python loksmith.py -k 7?3 -c 1\n"
         "  python loksmith.py -k 7531 -c 0,1,3,5\n"
-        "  python loksmith.py -k 08?5 -x 1:45,3:0 -e json\n"
+        "  python loksmith.py -k 08?5 -x 1:45,3:0 -I\n"
         "  python loksmith.py -k 4921 -c 2 -x 45,,0,9 -e csv"
     )
 
@@ -414,6 +737,12 @@ def main():
 
     out_group = parser.add_argument_group("Output Options")
     out_group.add_argument(
+        "-I",
+        "--interactive",
+        action="store_true",
+        help="Launch directly into Interactive CLI Stepper Mode",
+    )
+    out_group.add_argument(
         "-e",
         "--export",
         default="txt",
@@ -446,24 +775,24 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate key pattern (1 to 6 chars, 0-9 or '?')
+    # Validate key pattern
     key = args.key.strip()
     if not (1 <= len(key) <= 6) or not all(ch.isdigit() or ch == "?" for ch in key):
         print(
-            f"Error: Key must be 1 to 6 characters containing digits (0-9) or '?' wildcards. Received: '{args.key}'",
+            f"{C_RED}Error: Key must be 1 to 6 characters containing digits (0-9) or '?' wildcards. Received: '{args.key}'{C_RESET}",
             file=sys.stderr,
         )
         sys.exit(1)
 
     num_wheels = len(key)
 
-    # Parse and validate rotation counts (0 to 5 per wheel)
+    # Parse and validate rotation counts
     count_str = args.count.strip()
     if "," in count_str:
         raw_counts = count_str.split(",")
         if len(raw_counts) != num_wheels:
             print(
-                f"Error: Count vector length ({len(raw_counts)}) does not match key length ({num_wheels}).",
+                f"{C_RED}Error: Count vector length ({len(raw_counts)}) does not match key length ({num_wheels}).{C_RESET}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -472,7 +801,7 @@ def main():
             val_clean = val.strip()
             if not val_clean.isdigit() or not (0 <= int(val_clean) <= 5):
                 print(
-                    f"Error: Offset for wheel {idx + 1} must be an integer between 0 and 5. Received: '{val_clean}'",
+                    f"{C_RED}Error: Offset for wheel {idx + 1} must be an integer between 0 and 5. Received: '{val_clean}'{C_RESET}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -480,37 +809,33 @@ def main():
     else:
         if not count_str.isdigit() or not (0 <= int(count_str) <= 5):
             print(
-                f"Error: Count offset must be an integer between 0 and 5. Received: '{count_str}'",
+                f"{C_RED}Error: Count offset must be an integer between 0 and 5. Received: '{count_str}'{C_RESET}",
                 file=sys.stderr,
             )
             sys.exit(1)
         base_count = int(count_str)
-        # Wildcards default to full sweep (5), while known digits use base_count
         wheel_rotations = [5 if ch == "?" else base_count for ch in key]
 
-    # Wildcard dials must have an offset of 5
     for idx, ch in enumerate(key):
         if ch == "?" and wheel_rotations[idx] != 5:
             print(
-                f"Error: Wildcard dial {idx + 1} ('?') requires full sweep (count 5). Received count: {wheel_rotations[idx]}",
+                f"{C_RED}Error: Wildcard dial {idx + 1} ('?') requires full sweep (count 5). Received count: {wheel_rotations[idx]}{C_RESET}",
                 file=sys.stderr,
             )
             sys.exit(1)
 
-    # Parse exclusions
     try:
         excluded_map = parse_exclusions(args.exclude, num_wheels)
     except ValueError as err:
-        print(f"Error parsing exclusion argument: {err}", file=sys.stderr)
+        print(f"{C_RED}Error parsing exclusion argument: {err}{C_RESET}", file=sys.stderr)
         sys.exit(1)
 
-    # Resolve output directory
     output_dir = Path(args.output).expanduser().resolve()
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except OSError as err:
         print(
-            f"Error: Could not create output directory '{output_dir}': {err}",
+            f"{C_RED}Error: Could not create output directory '{output_dir}': {err}{C_RESET}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -559,10 +884,10 @@ def main():
     cand_display = ", ".join(f"W{i+1}: {len(c)}" for i, c in enumerate(wheel_candidates))
     has_excl = any(bool(excluded_map[w]) for w in range(num_wheels))
 
-    print("\n+======================================================+")
-    print("|  LOKSMITH: Code-Breaking Sequence Generator          |")
-    print("+======================================================+")
-    print(f"  Base Key           : {key} ({num_wheels} wheels)")
+    print(f"\n{C_CYAN}+======================================================+{C_RESET}")
+    print(f"{C_CYAN}|{C_RESET}  {C_BOLD}LOKSMITH: Code-Breaking Sequence Generator{C_RESET}          {C_CYAN}|{C_RESET}")
+    print(f"{C_CYAN}+======================================================+{C_RESET}")
+    print(f"  Base Key           : {C_BOLD}{key}{C_RESET} ({num_wheels} wheels)")
     print(f"  Offsets Per Wheel  : {offsets_display}")
     print(f"  Candidates / Wheel : {cand_display}")
     if has_excl:
@@ -572,23 +897,25 @@ def main():
             if excluded_map[w]
         )
         print(f"  Excluded Digits    : {excl_disp}")
-    print(f"  Total Combinations : {total_combos:,} (0 duplicates)")
-    print(f"  Total Dial Clicks  : {total_rotations:,}")
+    print(f"  Total Combinations : {C_BOLD}{total_combos:,}{C_RESET} (0 duplicates)")
+    print(f"  Total Dial Clicks  : {C_YELLOW}{total_rotations:,}{C_RESET}")
     avg_clicks = total_rotations / (total_combos - 1) if total_combos > 1 else 0.0
     print(f"  Average Clicks/Step: {avg_clicks:.2f}")
     print(f"  Iterations Only    : {'Enabled' if args.iterations_only else 'Disabled'}")
     print(f"  Exported File      : {out_file}\n")
 
-    preview_count = min(6, total_combos)
-    print(f"Preview of first {preview_count} steps:")
-    for item in sequence[:preview_count]:
-        if args.iterations_only:
-            print(f"  {item['combination']}")
-        else:
-            action_desc = f"({item['action']})" if item["action"] else ""
-            print(f"  [{item['step']:07d}]  {item['combination']}  {action_desc}")
-    if total_combos > preview_count:
-        print(f"  ... ({total_combos - preview_count:,} more steps saved to {out_file.name})\n")
+    # Interactive prompt or direct launch
+    if args.interactive:
+        run_interactive_stepper(sequence, key)
+    elif sys.stdin.isatty():
+        print(f"{C_YELLOW}Press 'i' to enter interactive mode (or Enter to exit): {C_RESET}", end="", flush=True)
+        try:
+            ch = get_key()
+            print()
+            if ch == "i":
+                run_interactive_stepper(sequence, key)
+        except (KeyboardInterrupt, EOFError):
+            print()
 
 
 if __name__ == "__main__":
